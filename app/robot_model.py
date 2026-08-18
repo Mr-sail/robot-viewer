@@ -188,7 +188,7 @@ def _load_model_xml(path: Path) -> str:
         raw_text = path.read_text(encoding="utf-8", errors="replace")
         if "xacro:" in raw_text:
             raise RobotModelError(
-                "xacro 文件需要本地安装 xacro 才能展开；当前环境仅支持直接加载 URDF，"
+                "当前安装包未包含 xacro 支持；请使用完整安装包、直接加载 URDF，"
                 "或加载已经展开成普通 XML 的 xacro 文件。"
             )
         return raw_text

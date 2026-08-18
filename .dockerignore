@@ -1,0 +1,11 @@
+.git
+.codex
+.agents
+__pycache__
+*.py[cod]
+.venv/
+.venv-packaging/
+build/
+dist/
+release/
+runtime-x86_64

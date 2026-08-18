@@ -187,6 +187,71 @@ ID    001001001001    001008001001
 - 当前事件识别只针对 `ErrCode`，其他状态字段暂不自动生成事件。
 - 如果不需要三维图，也可以不使用 `XYZ` 面板。
 
+## 生成 Ubuntu AppImage
+
+在项目根目录执行以下命令。构建机需要安装 Python、项目依赖和 PyInstaller；目标 Ubuntu 不需要安装 Python。
+
+```bash
+cd /home/zhuyufan/Desktop/Public/Escope
+curl -L -o appimagetool \
+  https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+chmod +x appimagetool
+./packaging/build_appimage.sh
+```
+
+成功后只需交付下面这个文件：
+
+```text
+release/Escope.AppImage
+```
+
+不要单独交付 `dist/Escope/Escope`，它依赖同目录下的 `_internal` 文件。目标机器如果没有 FUSE，可以使用：
+
+```bash
+APPIMAGE_EXTRACT_AND_RUN=1 ./Escope.AppImage
+```
+
+如果 xacro 文件使用了 ROS 的 `$(find package_name)`，还需要把 ROS 包资源准备到 AppImage 中。当前脚本默认打包 `estun_description` 和 `estun_hardware`：
+
+```bash
+ROS_INSTALL_PREFIX=/home/zhuyufan/estun_ws/install \
+  ./packaging/prepare_ros_bundle.sh
+```
+
+如果模型还依赖其他 ROS 包，可以指定包名：
+
+```bash
+ROS_INSTALL_PREFIX=/path/to/ros_ws/install \
+ROS_PACKAGES="estun_description estun_hardware another_description" \
+  ./packaging/prepare_ros_bundle.sh
+```
+
+该步骤只复制 `share/<package>` 资源，不会把本机 ROS 工作区或构建产物提交到 Git。准备完成后，再执行下面的 AppImage 构建命令；AppRun 会自动设置内置的 ROS 包搜索路径。
+
+如果需要兼容 Ubuntu 20.04，可以在 Ubuntu 22.04 主机上使用 Docker 构建，不需要另一台电脑：
+
+```bash
+sudo apt update
+sudo apt install -y docker.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+newgrp docker
+
+./packaging/build_ubuntu20_appimage.sh
+```
+
+构建结果为 `release/ubuntu20/Escope-Ubuntu20-x86_64.AppImage`。该版本应以 Ubuntu 20.04 的 glibc 作为兼容基线，建议在干净的 Ubuntu 20.04 虚拟机中最终验证。
+
+如果 Docker Hub 无法访问，可指定一个可访问的 Python 3.10 基础镜像和 Debian 镜像源：
+
+```bash
+UBUNTU20_IMAGE=<可访问的镜像仓库>/library/python:3.10-slim-bullseye \
+DEBIAN_MIRROR=<可访问的 Debian 镜像>/debian \
+DEBIAN_SECURITY_MIRROR=<可访问的 Debian 安全镜像>/debian-security \
+PIP_INDEX_URL=<可访问的 PyPI 镜像>/simple \
+  ./packaging/build_ubuntu20_appimage.sh
+```
+
 ## 测试
 
 运行测试：

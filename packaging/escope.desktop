@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Escope
+Comment=Robot log curve viewer
+Exec=Escope %F
+Icon=escope
+Terminal=false
+Categories=Science;
+MimeType=text/plain;

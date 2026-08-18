@@ -67,8 +67,32 @@ PACKAGE_MESH_URDF = """\
 </robot>
 """
 
+SIMPLE_XACRO = """\
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="xacro_arm">
+  <xacro:property name="joint_offset" value="1.25" />
+  <link name="base_link" />
+  <link name="tool0" />
+  <joint name="joint1" type="fixed">
+    <parent link="base_link" />
+    <child link="tool0" />
+    <origin xyz="${joint_offset} 0 0" rpy="0 0 0" />
+  </joint>
+</robot>
+"""
+
 
 class RobotModelTests(unittest.TestCase):
+    def test_load_robot_model_expands_xacro(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "simple.xacro"
+            path.write_text(SIMPLE_XACRO, encoding="utf-8")
+
+            model = load_robot_model(path)
+
+        self.assertEqual(model.name, "xacro_arm")
+        np.testing.assert_allclose(model.joints[0].origin_xyz, np.array([1.25, 0.0, 0.0]))
+
     def test_load_robot_model_from_urdf(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "simple.urdf"

@@ -1,9 +1,15 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-packaging/
 .codex
+/appimagetool
+/runtime-x86_64
+release/ubuntu20/
+packaging/ros_bundle/
 build/
 dist/
+release/
 *.spec
 *.txt
 !requirements.txt
