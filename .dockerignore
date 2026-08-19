@@ -9,3 +9,11 @@ build/
 dist/
 release/
 runtime-x86_64
+/appimagetool
+*.txt
+!requirements.txt
+!requirements-parser.txt
+!requirements-build.txt
+!requirements-dev.txt
+!tests/fixtures/*.txt
+.pytest_cache/

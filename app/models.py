@@ -51,4 +51,3 @@ class LogEvent:
     previous_value: float
     current_value: float
     event_type: str
-

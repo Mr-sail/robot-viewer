@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .events import detect_events
+from .events import EventDetectionSummary, detect_events_result
 from .models import LogEvent, ParsedLog, SignalNode
 from .parser import ParseError, parse_log_file
 from .plot_panels import BasePlotPanel, Plot2DPanel, Plot3DPanel, RobotPosePanel
@@ -109,6 +109,16 @@ class MainWindow(QMainWindow):
         widget.setAcceptDrops(True)
         widget.installEventFilter(self)
         self._drop_targets.append(widget)
+
+    def _unregister_drop_targets(self, *roots: QWidget) -> None:
+        retained_targets: list[QWidget] = []
+        for widget in self._drop_targets:
+            owned_by_panel = any(widget is root or root.isAncestorOf(widget) for root in roots)
+            if owned_by_panel:
+                widget.removeEventFilter(self)
+            else:
+                retained_targets.append(widget)
+        self._drop_targets = retained_targets
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 - Qt naming
         if self._extract_dropped_log_path(event) is not None:
@@ -322,9 +332,10 @@ class MainWindow(QMainWindow):
             progress.setValue(99)
             progress.setLabelText("正在识别事件...")
             QApplication.processEvents()
-            detected_events = detect_events(parsed)
+            event_result = detect_events_result(parsed)
+            detected_events = event_result.events
             progress.setValue(100)
-        except ParseError as exc:
+        except (OSError, ParseError) as exc:
             if progress.wasCanceled():
                 return
             QMessageBox.critical(self, "打开失败", str(exc))
@@ -338,7 +349,7 @@ class MainWindow(QMainWindow):
         self.current_sample_index = 0 if parsed.time_seconds.shape[0] else None
         self.signal_lookup = {signal.signal_id: signal for signal in parsed.signals}
         self._populate_tree(parsed.signals)
-        self._populate_event_table(detected_events)
+        self._populate_event_table(detected_events, event_result.summary)
         max_time_seconds = float(parsed.time_seconds[-1])
         for panel in self.panels:
             panel.selected_signal_ids = [
@@ -346,6 +357,7 @@ class MainWindow(QMainWindow):
             ]
             panel.clamp_time_range(max_time_seconds)
             panel.update_plot(self.parsed_log, self.signal_lookup)
+            panel.sync_sample_index(self.current_sample_index)
         if self.active_panel is not None:
             self._sync_tree_from_active_panel()
             self._sync_time_controls_from_active_panel()
@@ -408,7 +420,11 @@ class MainWindow(QMainWindow):
         self.apply_filter(self.search_input.text())
         self._sync_tree_from_active_panel()
 
-    def _populate_event_table(self, events: list[LogEvent]) -> None:
+    def _populate_event_table(
+        self,
+        events: list[LogEvent],
+        summary: EventDetectionSummary | None = None,
+    ) -> None:
         self.event_table.setRowCount(0)
         if not events:
             self.event_table.insertRow(0)
@@ -432,8 +448,17 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole, event.sample_index)
                 self.event_table.setItem(row, column, item)
 
-        self.event_table.setToolTip(f"识别到 {len(events)} 个状态/报警事件，双击可跳转到对应采样点")
-        self.event_summary_label.setText(f"事件: {len(events)}")
+        if summary is not None and summary.truncated:
+            tooltip = (
+                f"识别到 {summary.total_candidates} 个状态/报警事件，"
+                f"当前显示 {summary.returned_count} 个，已省略 {summary.truncated_count} 个。"
+            )
+            label = f"事件: {summary.returned_count}/{summary.total_candidates} (已省略 {summary.truncated_count})"
+        else:
+            tooltip = f"识别到 {len(events)} 个状态/报警事件，双击可跳转到对应采样点"
+            label = f"事件: {len(events)}"
+        self.event_table.setToolTip(tooltip)
+        self.event_summary_label.setText(label)
 
     def toggle_event_panel(self) -> None:
         visible = self.event_table.isVisible()
@@ -513,6 +538,7 @@ class MainWindow(QMainWindow):
         self.panels.remove(panel)
 
         if subwindow is not None:
+            self._unregister_drop_targets(subwindow, panel)
             subwindow.close_from_manager()
             self.mdi_area.removeSubWindow(subwindow)
             panel.setParent(None)

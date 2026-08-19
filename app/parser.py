@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -79,12 +80,23 @@ def build_signal_tree(xml_section: str, id_row: str) -> list[SignalNode]:
         raise ParseError("未找到有效的 ID 表头。")
 
     column_ids = id_fields[1:]
+    non_empty_column_ids = [signal_id for signal_id in column_ids if signal_id]
+    if len(non_empty_column_ids) != len(set(non_empty_column_ids)):
+        raise ParseError("ID 表头中存在重复信号 ID。")
     id_to_index = {signal_id: index for index, signal_id in enumerate(column_ids)}
 
     try:
         root = ET.fromstring(xml_section)
     except ET.ParseError as exc:
         raise ParseError(f"XML 头解析失败: {exc}") from exc
+
+    xml_put_ids = [
+        (element.attrib.get("id") or "").strip()
+        for element in root.iter("put")
+    ]
+    non_empty_xml_put_ids = [signal_id for signal_id in xml_put_ids if signal_id]
+    if len(non_empty_xml_put_ids) != len(set(non_empty_xml_put_ids)):
+        raise ParseError("XML 头中存在重复信号 ID。")
 
     leaf_definitions = list(_walk_leaf_definitions(root, ()))
     if not leaf_definitions:
@@ -153,8 +165,9 @@ def parse_log_file(path: str | Path, progress_callback: ProgressCallback | None 
     skipped_rows = 0
     time_raw: list[str] = []
     time_seconds: list[float] = []
-    rows: list[np.ndarray] = []
+    row_values_buffer = array("d")
     start_time: datetime | None = None
+    previous_time: datetime | None = None
     total_bytes = max(file_path.stat().st_size, 1)
     line_count = 0
 
@@ -205,7 +218,7 @@ def parse_log_file(path: str | Path, progress_callback: ProgressCallback | None 
             try:
                 row_time = _parse_time_token(fields[0])
                 row_values = np.fromiter((float(value) for value in fields[1:]), dtype=float, count=len(column_ids))
-            except ValueError:
+            except (TypeError, ValueError, OverflowError):
                 skipped_rows += 1
                 continue
 
@@ -213,22 +226,28 @@ def parse_log_file(path: str | Path, progress_callback: ProgressCallback | None 
                 skipped_rows += 1
                 continue
 
+            # Non-finite samples and backwards timestamps break interpolation/searchsorted assumptions.
+            if not np.isfinite(row_values).all() or (previous_time is not None and row_time < previous_time):
+                skipped_rows += 1
+                continue
+
             if start_time is None:
                 start_time = row_time
+            previous_time = row_time
 
             time_raw.append(fields[0])
             time_seconds.append((row_time - start_time).total_seconds())
-            rows.append(row_values)
+            row_values_buffer.extend(row_values)
 
     _report_progress(progress_callback, 96, "正在整理曲线数据...")
     if not separator_found:
         raise ParseError("文件缺少 XML 与数据区的分隔线。")
     if signal_nodes is None or column_ids is None or expected_fields is None:
         raise ParseError("未找到 ID 表头。")
-    if not rows:
+    if not time_raw:
         raise ParseError("未读取到任何有效数据行。")
 
-    matrix = np.vstack(rows)
+    matrix = np.frombuffer(row_values_buffer, dtype=np.float64).reshape(len(time_raw), len(column_ids))
     signals_by_id = {signal_id: matrix[:, index] for index, signal_id in enumerate(column_ids)}
 
     meta = LogFileMeta(

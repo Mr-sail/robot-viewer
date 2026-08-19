@@ -127,6 +127,7 @@ py -m pip install -r requirements.txt
 
 ```bash
 python3 -m pip install -r requirements-parser.txt
+python3 -m unittest tests.test_parser tests.test_events
 ```
 
 ## 运行
@@ -189,12 +190,14 @@ ID    001001001001    001008001001
 
 ## 生成 Ubuntu AppImage
 
-在项目根目录执行以下命令。构建机需要安装 Python、项目依赖和 PyInstaller；目标 Ubuntu 不需要安装 Python。
+在项目根目录执行以下命令。构建机需要 Python；目标 Ubuntu 不需要安装 Python。
 
 ```bash
 cd /home/zhuyufan/Desktop/Public/Escope
+python3 -m pip install -r requirements-build.txt
 curl -L -o appimagetool \
   https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+echo "a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0  appimagetool" | sha256sum --check
 chmod +x appimagetool
 ./packaging/build_appimage.sh
 ```
@@ -249,15 +252,19 @@ UBUNTU20_IMAGE=<可访问的镜像仓库>/library/python:3.10-slim-bullseye \
 DEBIAN_MIRROR=<可访问的 Debian 镜像>/debian \
 DEBIAN_SECURITY_MIRROR=<可访问的 Debian 安全镜像>/debian-security \
 PIP_INDEX_URL=<可访问的 PyPI 镜像>/simple \
+APPIMAGETOOL_SHA256=<已验证的 appimagetool SHA-256> \
   ./packaging/build_ubuntu20_appimage.sh
 ```
 
 ## 测试
 
-运行测试：
+安装开发依赖并运行 lint 与测试：
 
 ```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m flake8 app tests launcher.py ament_index_python
 python3 -m unittest discover -s tests
+bash -n packaging/*.sh
 ```
 
 Windows 下：

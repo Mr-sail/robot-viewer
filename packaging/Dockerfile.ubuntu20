@@ -40,21 +40,25 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG APPIMAGETOOL_SHA256=a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
 ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 
 WORKDIR /src
-COPY requirements.txt .
+COPY requirements.txt requirements-build.txt ./
 
 RUN python -m pip install --upgrade pip \
-    && python -m pip install --no-cache-dir -r requirements.txt pyinstaller
+    && python -m pip install --no-cache-dir -r requirements-build.txt
 
 COPY . .
+
+RUN QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v
 
 RUN if [ ! -x /src/appimagetool ]; then \
         curl -L --fail --retry 3 \
             -o /src/appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage; \
     fi \
+    && echo "${APPIMAGETOOL_SHA256}  /src/appimagetool" | sha256sum --check \
     && chmod +x /src/appimagetool
 
 RUN PYTHON_BIN=/usr/local/bin/python \

@@ -274,7 +274,11 @@ class Plot2DPanel(BasePlotPanel):
 
         self.legend = None
         self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#555555", width=1))
-        self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("#999999", width=1, style=Qt.PenStyle.DashLine))
+        self.h_line = pg.InfiniteLine(
+            angle=0,
+            movable=False,
+            pen=pg.mkPen("#999999", width=1, style=Qt.PenStyle.DashLine),
+        )
         self.plot_widget.addItem(self.v_line, ignoreBounds=True)
         self.plot_widget.addItem(self.h_line, ignoreBounds=True)
         self.v_line.setZValue(20)
@@ -651,6 +655,15 @@ class Plot2DPanel(BasePlotPanel):
         y_signal = signal_lookup[y_signal_id]
         x_series = self._get_display_series(x_signal_id)[indices]
         y_series = self._get_display_series(y_signal_id)[indices]
+        finite_mask = np.isfinite(x_series) & np.isfinite(y_series)
+        if not np.any(finite_mask):
+            self._visible_indices = np.array([], dtype=int)
+            self.message_label.setText("The selected X-Y signals contain no finite sample pairs.")
+            self._set_overlay_text("No finite X-Y sample pairs")
+            return
+        self._visible_indices = indices[finite_mask]
+        x_series = x_series[finite_mask]
+        y_series = y_series[finite_mask]
 
         x_label = self._display_signal_label(x_signal)
         y_label = self._display_signal_label(y_signal)
@@ -857,10 +870,27 @@ class Plot2DPanel(BasePlotPanel):
 
         x_series = self._get_display_series(self.selected_signal_ids[0])[self._visible_indices]
         y_series = self._get_display_series(self.selected_signal_ids[1])[self._visible_indices]
-        x_span = max(float(np.max(x_series) - np.min(x_series)), 1e-9)
-        y_span = max(float(np.max(y_series) - np.min(y_series)), 1e-9)
-        distances = ((x_series - x_value) / x_span) ** 2 + ((y_series - y_value) / y_span) ** 2
-        return int(self._visible_indices[int(np.argmin(distances))])
+        local_index = self._nearest_xy_local_index(x_series, y_series, x_value, y_value)
+        return None if local_index is None else int(self._visible_indices[local_index])
+
+    @staticmethod
+    def _nearest_xy_local_index(
+        x_series: np.ndarray,
+        y_series: np.ndarray,
+        x_value: float,
+        y_value: float,
+    ) -> int | None:
+        finite_mask = np.isfinite(x_series) & np.isfinite(y_series)
+        finite_positions = np.flatnonzero(finite_mask)
+        if finite_positions.size == 0:
+            return None
+
+        finite_x = x_series[finite_mask]
+        finite_y = y_series[finite_mask]
+        x_span = max(float(np.ptp(finite_x)), 1e-9)
+        y_span = max(float(np.ptp(finite_y)), 1e-9)
+        distances = ((finite_x - x_value) / x_span) ** 2 + ((finite_y - y_value) / y_span) ** 2
+        return int(finite_positions[int(np.argmin(distances))])
 
     def _update_xt_cursor(self, x_value: float) -> None:
         assert self.parsed_log is not None
@@ -924,10 +954,11 @@ class Plot2DPanel(BasePlotPanel):
 
         x_series = self._get_display_series(self.selected_signal_ids[0])[self._visible_indices]
         y_series = self._get_display_series(self.selected_signal_ids[1])[self._visible_indices]
-        x_span = max(float(np.max(x_series) - np.min(x_series)), 1e-9)
-        y_span = max(float(np.max(y_series) - np.min(y_series)), 1e-9)
-        distances = ((x_series - x_value) / x_span) ** 2 + ((y_series - y_value) / y_span) ** 2
-        index = int(self._visible_indices[int(np.argmin(distances))])
+        local_index = self._nearest_xy_local_index(x_series, y_series, x_value, y_value)
+        if local_index is None:
+            self._hide_cursor(broadcast=True)
+            return
+        index = int(self._visible_indices[local_index])
         self._current_cursor_index = index
         self._show_xy_cursor_at_index(index)
         if self._cursor_sync_callback is not None:
@@ -1037,6 +1068,10 @@ class Plot3DPanel(BasePlotPanel):
                 parsed_log.get_series(z_signal_id)[indices],
             ]
         ).astype(np.float32)
+        points = points[np.all(np.isfinite(points), axis=1)]
+        if points.shape[0] == 0:
+            self.message_label.setText("The selected XYZ signals contain no finite sample triples.")
+            return
         center = points.mean(axis=0)
         centered_points = points - center
 
@@ -1101,6 +1136,11 @@ class RobotPosePanel(BasePlotPanel):
         self.tool_axis_items: list[object] = []
         self._gl_init_requested = False
         self._gl_ready = False
+        self._pending_sample_index: int | None = None
+        self._pose_update_timer = QTimer(self)
+        self._pose_update_timer.setSingleShot(True)
+        self._pose_update_timer.setInterval(33)
+        self._pose_update_timer.timeout.connect(self._apply_pending_sample_index)
 
         self.load_model_button = QPushButton("Load URDF/Xacro")
         self.load_model_button.clicked.connect(self._open_model_dialog)
@@ -1292,52 +1332,60 @@ class RobotPosePanel(BasePlotPanel):
             return True
         return any(cls._joint_index_from_text(part) is not None for part in text_parts)
 
+    @classmethod
+    def _looks_like_joint_position_signal(cls, signal: SignalNode) -> bool:
+        source_score, metric_score, penalty, _ = cls._path_score(signal)
+        return (
+            cls._looks_like_joint_signal(signal)
+            and source_score <= 20
+            and metric_score <= 10
+            and penalty == 0
+        )
+
     def _auto_map_joint_signals(self) -> None:
-        self.joint_signal_map.clear()
         if self.robot_model is None or self.parsed_log is None:
+            self.joint_signal_map.clear()
             return
+
+        self.joint_signal_map = self._build_joint_signal_map(self.robot_model, self.parsed_log)
+
+    @classmethod
+    def _build_joint_signal_map(
+        cls,
+        robot_model: RobotModel,
+        parsed_log: ParsedLog,
+    ) -> dict[str, str]:
+        joint_signal_map: dict[str, str] = {}
 
         candidates = [
             signal
-            for signal in self.parsed_log.signals
-            if signal.available and signal.signal_id in self.parsed_log.signals_by_id
-            and self._looks_like_joint_signal(signal)
+            for signal in parsed_log.signals
+            if signal.available
+            and signal.signal_id in parsed_log.signals_by_id
+            and cls._looks_like_joint_position_signal(signal)
         ]
-        candidates.sort(key=lambda signal: (*self._path_score(signal), *self._joint_sort_key(signal)))
-        movable_joints = self.robot_model.movable_joints
+        candidates.sort(key=lambda signal: (*cls._path_score(signal), *cls._joint_sort_key(signal)))
+        movable_joints = robot_model.movable_joints
         if not candidates or not movable_joints:
-            return
+            return joint_signal_map
 
         candidate_by_index: dict[int, SignalNode] = {}
         for signal in candidates:
             for part in (signal.name, signal.full_path, *signal.path_parts):
-                joint_index = self._joint_index_from_text(part)
+                joint_index = cls._joint_index_from_text(part)
                 if joint_index is None:
                     continue
                 previous = candidate_by_index.get(joint_index)
-                if previous is None or self._path_score(signal) < self._path_score(previous):
+                if previous is None or cls._path_score(signal) < cls._path_score(previous):
                     candidate_by_index[joint_index] = signal
                     break
 
-        used_signal_ids: set[str] = set()
         for joint in movable_joints:
-            joint_index = self._joint_index_from_text(joint.name)
+            joint_index = cls._joint_index_from_text(joint.name)
             if joint_index is not None and joint_index in candidate_by_index:
                 signal = candidate_by_index[joint_index]
-                self.joint_signal_map[joint.name] = signal.signal_id
-                used_signal_ids.add(signal.signal_id)
-
-        sequential_signals = [
-            signal
-            for signal in candidates
-            if signal.signal_id not in used_signal_ids
-        ]
-        sequential_signals.sort(key=lambda signal: (*self._path_score(signal), *self._joint_sort_key(signal)))
-        for joint in movable_joints:
-            if joint.name in self.joint_signal_map or not sequential_signals:
-                continue
-            signal = sequential_signals.pop(0)
-            self.joint_signal_map[joint.name] = signal.signal_id
+                joint_signal_map[joint.name] = signal.signal_id
+        return joint_signal_map
 
     def update_plot(self, parsed_log: ParsedLog | None, signal_lookup: dict[str, SignalNode]) -> None:
         previous_log = self.parsed_log
@@ -1345,10 +1393,15 @@ class RobotPosePanel(BasePlotPanel):
         self.signal_lookup = signal_lookup
         if parsed_log is not previous_log:
             self._auto_fit_pending = True
+            self._pose_update_timer.stop()
+            self._pending_sample_index = None
+            self.current_sample_index = 0 if parsed_log is not None and parsed_log.time_seconds.size else None
         if parsed_log is not None:
             sample_count = parsed_log.time_seconds.shape[0]
             if sample_count > 0 and (
-                self.current_sample_index is None or self.current_sample_index < 0 or self.current_sample_index >= sample_count
+                self.current_sample_index is None
+                or self.current_sample_index < 0
+                or self.current_sample_index >= sample_count
             ):
                 self.current_sample_index = 0
 
@@ -1361,11 +1414,28 @@ class RobotPosePanel(BasePlotPanel):
         sample_count = self.parsed_log.time_seconds.shape[0]
         if sample_count == 0:
             return
-        self.current_sample_index = max(0, min(int(index), sample_count - 1))
+        clamped_index = max(0, min(int(index), sample_count - 1))
+        if clamped_index == self.current_sample_index and self._pending_sample_index is None:
+            return
+        self._pending_sample_index = clamped_index
+        if not self._pose_update_timer.isActive():
+            self._pose_update_timer.start()
+
+    def _apply_pending_sample_index(self) -> None:
+        if self._pending_sample_index is None:
+            return
+        self.current_sample_index = self._pending_sample_index
+        self._pending_sample_index = None
         self._refresh_pose()
 
     def focus_sample_index(self, index: int) -> None:
-        self.sync_sample_index(index)
+        if self.parsed_log is None or self.parsed_log.time_seconds.size == 0:
+            return
+        self._pose_update_timer.stop()
+        self._pending_sample_index = None
+        sample_count = self.parsed_log.time_seconds.shape[0]
+        self.current_sample_index = max(0, min(int(index), sample_count - 1))
+        self._refresh_pose()
 
     def _joint_values_for_index(self, sample_index: int) -> dict[str, float]:
         if self.parsed_log is None or self.robot_model is None:
@@ -1377,6 +1447,8 @@ class RobotPosePanel(BasePlotPanel):
             if signal_id is None or signal_id not in self.parsed_log.signals_by_id:
                 continue
             raw_value = float(self.parsed_log.get_series(signal_id)[sample_index])
+            if not np.isfinite(raw_value):
+                continue
             if joint.joint_type in {"revolute", "continuous"} and self.angle_unit == "deg":
                 raw_value = float(np.deg2rad(raw_value))
             joint_values[joint.name] = raw_value
@@ -1394,7 +1466,8 @@ class RobotPosePanel(BasePlotPanel):
             raw_value = float(self.parsed_log.get_series(signal_id)[sample_index])
             signal = self.signal_lookup.get(signal_id)
             source_label = signal.full_path if signal is not None else signal_id
-            joint_parts.append(f"{joint.name}<-{source_label}={raw_value:.3f}")
+            formatted_value = f"{raw_value:.3f}" if np.isfinite(raw_value) else "n/a"
+            joint_parts.append(f"{joint.name}<-{source_label}={formatted_value}")
 
         if not joint_parts:
             return f"Follow: sample={sample_index} | no mapped joint values"
@@ -1425,7 +1498,11 @@ class RobotPosePanel(BasePlotPanel):
         origin: np.ndarray,
         rotation: np.ndarray,
         length: float,
-        colors: tuple[tuple[float, float, float, float], tuple[float, float, float, float], tuple[float, float, float, float]],
+        colors: tuple[
+            tuple[float, float, float, float],
+            tuple[float, float, float, float],
+            tuple[float, float, float, float],
+        ],
         *,
         width: float,
     ) -> list[object]:
@@ -1584,8 +1661,6 @@ class RobotPosePanel(BasePlotPanel):
             )
             self.gl_widget.addItem(self.joint_item)
 
-        span = np.maximum(max_point - min_point, 1e-6)
-        max_span = max(float(np.max(span)), 1.0)
         actual_span = max(float(np.max(max_point - min_point)), 1e-6)
         grid_scale = max(actual_span / 6.0, 0.05)
         distance = max(actual_span * 2.4, 1.2)

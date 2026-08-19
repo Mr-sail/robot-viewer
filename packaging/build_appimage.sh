@@ -38,6 +38,7 @@ command -v "$python_bin" >/dev/null 2>&1 || {
     --exclude-module jupyter \
     --exclude-module jupyter_rfb \
     --collect-submodules xacro \
+    --collect-submodules ament_index_python \
     "$project_root/launcher.py"
 
 rm -rf "$app_dir"

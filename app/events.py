@@ -1,11 +1,37 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from .models import LogEvent, ParsedLog, SignalNode
 
 
 MAX_EVENTS_PER_SIGNAL = 200
+
+
+@dataclass(frozen=True)
+class EventDetectionSummary:
+    """Counts describing event candidates discarded by detection limits."""
+
+    total_candidates: int
+    per_signal_truncated_count: int
+    global_truncated_count: int
+    returned_count: int
+
+    @property
+    def truncated_count(self) -> int:
+        return self.per_signal_truncated_count + self.global_truncated_count
+
+    @property
+    def truncated(self) -> bool:
+        return self.truncated_count > 0
+
+
+@dataclass(frozen=True)
+class EventDetectionResult:
+    events: list[LogEvent]
+    summary: EventDetectionSummary
 
 
 def _normalize_token(text: str) -> str:
@@ -20,26 +46,23 @@ def _event_type_for_signal(signal: SignalNode) -> str | None:
 
 
 def _changed_indices(values: np.ndarray, event_type: str) -> np.ndarray:
+    changed, _ = _changed_indices_with_stats(values, event_type)
+    return changed
+
+
+def _changed_indices_with_stats(values: np.ndarray, event_type: str) -> tuple[np.ndarray, int]:
     finite_pairs = np.isfinite(values[1:]) & np.isfinite(values[:-1])
     changed = np.flatnonzero(finite_pairs & (values[1:] != values[:-1])) + 1
     if event_type == "报警/错误变化":
         changed = changed[(values[changed] != 0) | (values[changed - 1] != 0)]
-    return changed[:MAX_EVENTS_PER_SIGNAL]
+    limited = changed[:MAX_EVENTS_PER_SIGNAL]
+    return limited, max(0, int(changed.size - limited.size))
 
 
-def _looks_like_discrete_event_series(values: np.ndarray) -> bool:
-    finite_values = values[np.isfinite(values)]
-    if finite_values.size == 0:
-        return False
-
-    integer_like = np.all(np.isclose(finite_values, np.round(finite_values), atol=1e-9))
-    unique_count = np.unique(finite_values).size
-    unique_ratio = unique_count / finite_values.size
-    return integer_like and (unique_count <= 64 or unique_ratio <= 0.1)
-
-
-def detect_events(parsed_log: ParsedLog, *, max_events: int = 1000) -> list[LogEvent]:
+def detect_events_result(parsed_log: ParsedLog, *, max_events: int = 1000) -> EventDetectionResult:
     events: list[LogEvent] = []
+    total_candidates = 0
+    per_signal_truncated_count = 0
 
     for signal in parsed_log.signals:
         if not signal.available or signal.signal_id not in parsed_log.signals_by_id:
@@ -52,10 +75,11 @@ def detect_events(parsed_log: ParsedLog, *, max_events: int = 1000) -> list[LogE
         values = parsed_log.get_series(signal.signal_id)
         if values.shape[0] < 2:
             continue
-        if not _looks_like_discrete_event_series(values):
-            continue
 
-        for index in _changed_indices(values, event_type):
+        changed_indices, signal_truncated_count = _changed_indices_with_stats(values, event_type)
+        per_signal_truncated_count += signal_truncated_count
+        total_candidates += int(changed_indices.size + signal_truncated_count)
+        for index in changed_indices:
             sample_index = int(index)
             events.append(
                 LogEvent(
@@ -71,4 +95,18 @@ def detect_events(parsed_log: ParsedLog, *, max_events: int = 1000) -> list[LogE
                 )
             )
 
-    return sorted(events, key=lambda event: (event.sample_index, event.signal_path))[:max_events]
+    ordered_events = sorted(events, key=lambda event: (event.sample_index, event.signal_path))
+    limited_events = ordered_events[:max_events]
+    global_truncated_count = max(0, len(ordered_events) - len(limited_events))
+    summary = EventDetectionSummary(
+        total_candidates=total_candidates,
+        per_signal_truncated_count=per_signal_truncated_count,
+        global_truncated_count=global_truncated_count,
+        returned_count=len(limited_events),
+    )
+    return EventDetectionResult(events=limited_events, summary=summary)
+
+
+def detect_events(parsed_log: ParsedLog, *, max_events: int = 1000) -> list[LogEvent]:
+    """Return detected events while preserving the original list-returning API."""
+    return list(detect_events_result(parsed_log, max_events=max_events).events)

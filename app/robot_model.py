@@ -47,6 +47,7 @@ class RobotVisualMesh:
 class RobotModel:
     name: str
     root_link: str
+    tool_link: str
     joints: list[RobotJoint]
     links: tuple[str, ...]
     children_by_link: dict[str, list[RobotJoint]]
@@ -61,8 +62,12 @@ class RobotModel:
         joint_positions: list[np.ndarray] = []
         joint_transforms: dict[str, np.ndarray] = {}
         link_transforms: dict[str, np.ndarray] = {self.root_link: np.eye(4, dtype=float)}
+        visited_links: set[str] = set()
 
         def walk(link_name: str, parent_transform: np.ndarray) -> None:
+            if link_name in visited_links:
+                raise RobotModelError(f"模型拓扑包含重复访问的 link: {link_name}")
+            visited_links.add(link_name)
             parent_position = parent_transform[:3, 3].copy()
             for joint in self.children_by_link.get(link_name, []):
                 origin_transform = _compose_transform(joint.origin_xyz, joint.origin_rpy)
@@ -82,7 +87,7 @@ class RobotModel:
                 walk(joint.child, child_transform)
 
         walk(self.root_link, np.eye(4, dtype=float))
-        tool_transform = link_transforms.get(self.joints[-1].child, np.eye(4, dtype=float))
+        tool_transform = link_transforms.get(self.tool_link, np.eye(4, dtype=float))
         return RobotPoseState(
             segments=segments,
             joint_positions=joint_positions,
@@ -112,9 +117,12 @@ def _parse_vector(text: str | None, *, default: tuple[float, float, float]) -> n
     if len(parts) != 3:
         raise RobotModelError(f"expected 3 numbers, got: {text!r}")
     try:
-        return np.array([float(part) for part in parts], dtype=float)
+        vector = np.array([float(part) for part in parts], dtype=float)
     except ValueError as exc:
         raise RobotModelError(f"invalid numeric vector: {text!r}") from exc
+    if not np.isfinite(vector).all():
+        raise RobotModelError(f"numeric vector must contain finite values: {text!r}")
+    return vector
 
 
 def _rotation_matrix_from_rpy(rpy: np.ndarray) -> np.ndarray:
@@ -208,8 +216,21 @@ def _candidate_package_roots(model_path: Path) -> list[Path]:
     return roots
 
 
+def _candidate_package_prefixes() -> list[Path]:
+    prefixes: list[Path] = []
+    for variable_name in ("ESCOPE_ROS_PREFIX_PATH", "AMENT_PREFIX_PATH"):
+        for entry in os.environ.get(variable_name, "").split(os.pathsep):
+            if entry.strip():
+                prefixes.append(Path(entry).expanduser())
+    return prefixes
+
+
 def _resolve_package_mesh_path(package_name: str, relative_path: str, model_path: Path) -> Path | None:
     relative = Path(relative_path.lstrip("/"))
+    for prefix in _candidate_package_prefixes():
+        candidate = (prefix / "share" / package_name / relative).resolve()
+        if candidate.exists():
+            return candidate
     for root in _candidate_package_roots(model_path):
         if root.name == package_name:
             candidate = (root / relative).resolve()
@@ -287,6 +308,67 @@ def _parse_visual_meshes(root: ET.Element, model_path: Path) -> tuple[RobotVisua
     return tuple(visual_meshes)
 
 
+def _build_robot_graph(
+    links: tuple[str, ...], joints: list[RobotJoint]
+) -> tuple[str, str, list[RobotJoint], dict[str, list[RobotJoint]]]:
+    link_names = set(links)
+    if len(link_names) != len(links):
+        raise RobotModelError("模型中的 link 名称必须唯一。")
+
+    joint_names: set[str] = set()
+    parent_by_child: dict[str, str] = {}
+    children_by_link: dict[str, list[RobotJoint]] = {}
+    for joint in joints:
+        if joint.name in joint_names:
+            raise RobotModelError(f"模型中的 joint 名称重复: {joint.name}")
+        joint_names.add(joint.name)
+
+        if joint.parent not in link_names:
+            raise RobotModelError(f"joint {joint.name} 引用了不存在的 parent link: {joint.parent}")
+        if joint.child not in link_names:
+            raise RobotModelError(f"joint {joint.name} 引用了不存在的 child link: {joint.child}")
+        if joint.child in parent_by_child:
+            raise RobotModelError(f"link {joint.child} 由多个 joint 连接到父节点。")
+
+        parent_by_child[joint.child] = joint.parent
+        children_by_link.setdefault(joint.parent, []).append(joint)
+
+    root_candidates = [link_name for link_name in links if link_name not in parent_by_child]
+    if len(root_candidates) != 1:
+        raise RobotModelError(
+            f"模型必须恰好有一个根 link，当前找到 {len(root_candidates)} 个。"
+        )
+    root_link = root_candidates[0]
+
+    ordered_joints: list[RobotJoint] = []
+    visited_links: set[str] = set()
+    link_depths: dict[str, int] = {root_link: 0}
+
+    def visit(link_name: str) -> None:
+        if link_name in visited_links:
+            raise RobotModelError(f"模型拓扑包含环: {link_name}")
+        visited_links.add(link_name)
+        for joint in children_by_link.get(link_name, []):
+            ordered_joints.append(joint)
+            link_depths[joint.child] = link_depths[link_name] + 1
+            visit(joint.child)
+
+    visit(root_link)
+    if visited_links != link_names:
+        unreachable_links = ", ".join(sorted(link_names - visited_links))
+        raise RobotModelError(f"模型拓扑不连通或包含环，无法从根节点访问: {unreachable_links}")
+
+    leaf_links = {link_name for link_name in links if link_name not in children_by_link}
+    preferred_tool_links = ("tool0", "tool", "flange", "ee_link", "end_effector")
+    # Conventional end-effector names are more reliable than joint order in branched models.
+    tool_link = next(
+        (link_name for link_name in preferred_tool_links if link_name in leaf_links), None
+    )
+    if tool_link is None:
+        tool_link = min(leaf_links, key=lambda link_name: (-link_depths[link_name], link_name))
+    return root_link, tool_link, ordered_joints, children_by_link
+
+
 def load_robot_model(path: str | Path) -> RobotModel:
     model_path = Path(path).expanduser().resolve()
     if not model_path.exists():
@@ -296,13 +378,19 @@ def load_robot_model(path: str | Path) -> RobotModel:
 
     try:
         root = ET.fromstring(_load_model_xml(model_path))
+    except OSError as exc:
+        raise RobotModelError(f"机器人模型读取失败: {exc}") from exc
     except ET.ParseError as exc:
         raise RobotModelError(f"机器人模型 XML 解析失败: {exc}") from exc
 
     if root.tag != "robot":
         raise RobotModelError("模型根节点不是 <robot>，请提供 URDF 或可展开的 xacro 文件。")
 
-    links = tuple(link.attrib.get("name", "").strip() for link in root.findall("link") if link.attrib.get("name"))
+    links = tuple(
+        link.attrib.get("name", "").strip()
+        for link in root.findall("link")
+        if link.attrib.get("name", "").strip()
+    )
     visual_meshes = _parse_visual_meshes(root, model_path)
     joints: list[RobotJoint] = []
 
@@ -319,7 +407,7 @@ def load_robot_model(path: str | Path) -> RobotModel:
             child_link = (child_element.attrib.get("link") or child_link).strip()
 
         if not name or not joint_type or not parent_link or not child_link:
-            continue
+            raise RobotModelError("joint 定义缺少 name、type、parent 或 child。")
 
         origin_element = joint_element.find("origin")
         axis_element = joint_element.find("axis")
@@ -335,6 +423,11 @@ def load_robot_model(path: str | Path) -> RobotModel:
             axis_element.attrib.get("xyz") if axis_element is not None else None,
             default=(1.0, 0.0, 0.0),
         )
+        if joint_type in {"revolute", "continuous", "prismatic"}:
+            axis_norm = float(np.linalg.norm(axis))
+            if not np.isfinite(axis_norm) or axis_norm <= 1e-12:
+                raise RobotModelError(f"可运动 joint {name} 的 axis 必须是非零有限向量。")
+            axis = axis / axis_norm
         joints.append(
             RobotJoint(
                 name=name,
@@ -350,37 +443,12 @@ def load_robot_model(path: str | Path) -> RobotModel:
     if not joints:
         raise RobotModelError("模型中没有可用 joint 定义。")
 
-    child_links = {joint.child for joint in joints}
-    root_candidates = [link_name for link_name in links if link_name and link_name not in child_links]
-    root_link = root_candidates[0] if root_candidates else joints[0].parent
-
-    children_by_link: dict[str, list[RobotJoint]] = {}
-    for joint in joints:
-        children_by_link.setdefault(joint.parent, []).append(joint)
-
-    ordered_joints: list[RobotJoint] = []
-    ordered_joint_names: set[str] = set()
-    visited_children: set[str] = set()
-
-    def visit(link_name: str) -> None:
-        for joint in children_by_link.get(link_name, []):
-            if joint.child in visited_children:
-                continue
-            visited_children.add(joint.child)
-            ordered_joints.append(joint)
-            ordered_joint_names.add(joint.name)
-            visit(joint.child)
-
-    visit(root_link)
-    if len(ordered_joints) != len(joints):
-        for joint in joints:
-            if joint.name not in ordered_joint_names:
-                ordered_joints.append(joint)
-                ordered_joint_names.add(joint.name)
+    root_link, tool_link, ordered_joints, children_by_link = _build_robot_graph(links, joints)
 
     return RobotModel(
         name=(root.attrib.get("name") or model_path.stem).strip() or model_path.stem,
         root_link=root_link,
+        tool_link=tool_link,
         joints=ordered_joints,
         links=links,
         children_by_link=children_by_link,

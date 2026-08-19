@@ -9,6 +9,7 @@ base_image="${UBUNTU20_IMAGE:-python:3.10-slim-bullseye}"
 debian_mirror="${DEBIAN_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian}"
 debian_security_mirror="${DEBIAN_SECURITY_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn/debian-security}"
 pip_index_url="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+appimagetool_sha256="${APPIMAGETOOL_SHA256:-a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0}"
 container_id=""
 
 cleanup() {
@@ -34,6 +35,7 @@ DOCKER_BUILDKIT=0 docker build \
     --build-arg "DEBIAN_MIRROR=$debian_mirror" \
     --build-arg "DEBIAN_SECURITY_MIRROR=$debian_security_mirror" \
     --build-arg "PIP_INDEX_URL=$pip_index_url" \
+    --build-arg "APPIMAGETOOL_SHA256=$appimagetool_sha256" \
     --target builder \
     --tag "$image_tag" \
     "$project_root"

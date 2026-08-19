@@ -39,4 +39,3 @@ def get_package_share_directory(package_name: str, print_warning: bool = True) -
     raise PackageNotFoundError(
         f"package {package_name!r} was not found in bundled ROS prefixes: {searched}"
     )
-
